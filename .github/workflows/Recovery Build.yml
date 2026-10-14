@@ -1,11 +1,3 @@
-# Place at: .github/workflows/orangefox-build.yml  (in YOUR FORK of the roadstr device tree)
-#
-# Builds OrangeFox for the Motorola Edge 70 (roadstr) using the official OrangeFox
-# sync script (orangefox_sync.sh), NOT the TWRP minimal-manifest flow.
-#
-# The workflow checks out the device tree from THIS repo (at the branch you pick in
-# the "Run workflow" dropdown), so commit any tree fixes to your fork first.
-#
 # UNTESTED: nobody has run this end to end yet. Read the notes at the bottom.
 
 name: OrangeFox Build (roadstr)
@@ -13,6 +5,21 @@ name: OrangeFox Build (roadstr)
 on:
   workflow_dispatch:
     inputs:
+      DEVICE_TREE_URL:
+        description: Device tree git URL (public repo)
+        type: string
+        required: true
+        default: https://github.com/Retardpro/android_device_motorola_roadstr
+      DEVICE_TREE_BRANCH:
+        description: Device tree branch (leave blank for the repo's default branch)
+        type: string
+        required: false
+        default: ""
+      APPLY_PATCH:
+        description: Apply patches/roadstr-tree-fixes.patch from this repo on top of the tree
+        type: boolean
+        required: true
+        default: true
       FOX_BRANCH:
         description: OrangeFox manifest branch passed to orangefox_sync.sh --branch
         type: string
@@ -65,10 +72,34 @@ jobs:
           remove-codeql: "true"
           remove-docker-images: "true"
 
-      - name: Check out device tree
+      - name: Check out this repo (for the patch)
         uses: actions/checkout@v4
         with:
-          path: tree
+          path: actions-repo
+
+      - name: Clone device tree
+        env:
+          TREE_URL: ${{ inputs.DEVICE_TREE_URL }}
+          TREE_BRANCH: ${{ inputs.DEVICE_TREE_BRANCH }}
+        run: |
+          case "$TREE_URL" in
+            https://github.com/*|https://gitlab.com/*) ;;
+            *) echo "::error::DEVICE_TREE_URL must start with https://github.com/ or https://gitlab.com/"; exit 1 ;;
+          esac
+          git clone --depth 1 ${TREE_BRANCH:+-b "$TREE_BRANCH"} "$TREE_URL" tree
+          git -C tree log -1 --format='Tree commit: %H %s'
+
+      - name: Apply tree patch
+        if: inputs.APPLY_PATCH
+        run: |
+          PATCH="$GITHUB_WORKSPACE/actions-repo/patches/roadstr-tree-fixes.patch"
+          [ -f "$PATCH" ] || { echo "::error::$PATCH not found in this repo"; exit 1; }
+          cd tree
+          if git apply --check "$PATCH"; then
+            git apply "$PATCH" && echo "Patch applied."
+          else
+            echo "::warning::Patch does not apply cleanly (tree may have changed upstream). Continuing WITHOUT it."
+          fi
 
       - name: Preflight checks on the tree (fails fast, before the long sync)
         env:
@@ -86,7 +117,7 @@ jobs:
           fi
           # 3. inline comments after := values leave a trailing space in the value
           if grep -nE ':=[^#]*[[:space:]]#' ./*.mk; then
-            echo "::warning::Inline comments after := values found (trailing space ends up in the value). Apply roadstr-tree-fixes.patch."
+            echo "::warning::Inline comments after := values found (trailing space ends up in the value). Enable APPLY_PATCH or fix the tree."
           fi
           # 4. FOX_ vars are ignored inside .mk files
           if grep -nE '^\s*FOX_[A-Z_]+\s*:?=' ./*.mk; then
