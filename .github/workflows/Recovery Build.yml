@@ -15,11 +15,6 @@ on:
         type: string
         required: false
         default: ""
-      APPLY_PATCH:
-        description: Apply patches/roadstr-tree-fixes.patch from this repo on top of the tree
-        type: boolean
-        required: true
-        default: true
       FOX_BRANCH:
         description: OrangeFox manifest branch passed to orangefox_sync.sh --branch
         type: string
@@ -88,18 +83,6 @@ jobs:
           esac
           git clone --depth 1 ${TREE_BRANCH:+-b "$TREE_BRANCH"} "$TREE_URL" tree
           git -C tree log -1 --format='Tree commit: %H %s'
-
-      - name: Apply tree patch
-        if: inputs.APPLY_PATCH
-        run: |
-          PATCH="$GITHUB_WORKSPACE/actions-repo/patches/roadstr-tree-fixes.patch"
-          [ -f "$PATCH" ] || { echo "::error::$PATCH not found in this repo"; exit 1; }
-          cd tree
-          if git apply --check "$PATCH"; then
-            git apply "$PATCH" && echo "Patch applied."
-          else
-            echo "::warning::Patch does not apply cleanly (tree may have changed upstream). Continuing WITHOUT it."
-          fi
 
       - name: Preflight checks on the tree (fails fast, before the long sync)
         env:
