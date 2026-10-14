@@ -1,268 +1,193 @@
-name: Recovery Build
+# Place at: .github/workflows/orangefox-build.yml  (in YOUR FORK of the roadstr device tree)
+#
+# Builds OrangeFox for the Motorola Edge 70 (roadstr) using the official OrangeFox
+# sync script (orangefox_sync.sh), NOT the TWRP minimal-manifest flow.
+#
+# The workflow checks out the device tree from THIS repo (at the branch you pick in
+# the "Run workflow" dropdown), so commit any tree fixes to your fork first.
+#
+# UNTESTED: nobody has run this end to end yet. Read the notes at the bottom.
+
+name: OrangeFox Build (roadstr)
 
 on:
   workflow_dispatch:
     inputs:
-      MANIFEST_BRANCH:
+      FOX_BRANCH:
+        description: OrangeFox manifest branch passed to orangefox_sync.sh --branch
+        type: string
+        required: true
+        default: "14.1"
+      LUNCH_CHOICE:
+        description: lunch target (must be listed in AndroidProducts.mk)
+        type: string
+        required: true
+        default: fox_roadstr-ap2a-eng
+      BUILD_TARGET:
+        description: What to build (tree has a dedicated recovery partition)
         type: choice
-        description: Manifest Branch
         options:
-        - 12.1
-        - 11
-        - 9.0
-        - 8.1
-        - 7.1
-        - 6.0
+          - recoveryimage
+          - vendorbootimage
+          - bootimage
         required: true
-        default: 12.1
-      DEVICE_TREE_URL:
-        description: Device Tree URL
-        required: true
-        default: https://github.com/retardpro/android_device_motorola_roadstr
-      DEVICE_TREE_BRANCH:
-        description: Device Tree Branch
-        required: true
-        default: twrp-12.1
-      DEVICE_PATH:
-        description: Path the device tree should be synced to, relative to source root
-        required: true
-        default: device/motorola/roadstr
-      DEVICE_NAME:
-        description: Device Name from tree (should match name on twrp_<DEVICE_NAME>.mk)
-        required: true
-        default: roadstr
-      REPOPICK_PATCHES:
-        description: (Optional) Gerrit commit numbers separated by a space to be included in the build (leave blank if not using)
+        default: recoveryimage
+      EXTRA_EXPORTS:
+        description: Space-separated KEY=VALUE exports (FOX_* vars MUST go here, not in .mk files)
         type: string
         required: false
-      BUILD_TARGET:
-        type: choice
-        description: Partition containing recovery ramdisk
-        options:
-        - boot
-        - recovery
-        - vendor_boot
-        required: true
-        default: vendor_boot
-      RECOVERY_INSTALLER:
-        description: Include recovery installer zip
-        type: boolean
-        required: true
-        default: false
+        default: "FOX_AB_DEVICE=1 FOX_VIRTUAL_AB_DEVICE=1 OF_DEFAULT_KEYMASTER_VERSION=4.1"
+
+permissions:
+  contents: read
+
+env:
+  DEVICE_NAME: roadstr
+  DEVICE_PATH: device/motorola/roadstr
 
 jobs:
   build:
+    # Only the repo owner can trigger a build
     if: github.event.repository.owner.id == github.event.sender.id
     runs-on: ubuntu-22.04
-    # You can use either of the ubuntu-20.04 or ubuntu-22.04 runner
+    timeout-minutes: 350   # hard job limit on hosted runners is 360
+
     steps:
-    - name: Display Run Parameters
-      run: |
-        echo "::group::User Environment Variables"
-        echo "Manifest Branch: ${{ inputs.MANIFEST_BRANCH }}"
-        echo "Device Tree URL: ${{ inputs.DEVICE_TREE_URL }}"
-        echo "Device Tree Branch: ${{ inputs.DEVICE_TREE_BRANCH }}"
-        echo "Device Path: ${{ inputs.DEVICE_PATH }}"
-        echo "Device Name: ${{ inputs.DEVICE_NAME }}"
-        echo "Build Target: ${{ inputs.BUILD_TARGET }}.img"
-        echo "Include Recovery Installer: ${{ inputs.RECOVERY_INSTALLER }}"
-        echo "::endgroup::"
- 
-    # You might want to Checkout your repo first, but not mandatory
-    - name: Check Out
-      uses: actions/checkout@v4
-            
-    # Cleanup The Actions Workspace Using Custom Composite Run Actions
-    - name: Cleanup
-      uses: rokibhasansagar/slimhub_actions@main
-      # That's it! Now use your normal steps
+      # Must run BEFORE checkout: it re-mounts $GITHUB_WORKSPACE on a big merged volume
+      - name: Free up disk space and add swap
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 16384
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
 
-    - name: Set Swap Space
-      uses: pierotofy/set-swap-space@master
-      with:
-        swap-size-gb: 24
+      - name: Check out device tree
+        uses: actions/checkout@v4
+        with:
+          path: tree
 
-    - name: Prepare the environment
-      run: |
-        sudo apt update
-        sudo apt -y upgrade
-        sudo apt -y install gperf gcc-multilib gcc-10-multilib g++-multilib g++-10-multilib libc6-dev lib32ncurses5-dev x11proto-core-dev libx11-dev tree lib32z-dev libgl1-mesa-dev libxml2-utils xsltproc bc ccache lib32readline-dev lib32z1-dev liblz4-tool libncurses5-dev libsdl1.2-dev libwxgtk3.0-gtk3-dev libxml2 lzop pngcrush schedtool squashfs-tools imagemagick libbz2-dev lzma ncftp qemu-user-static libstdc++-10-dev libtinfo5
-        sudo add-apt-repository universe
-        sudo apt -y install libncurses5
+      - name: Preflight checks on the tree (fails fast, before the long sync)
+        env:
+          LUNCH_CHOICE: ${{ inputs.LUNCH_CHOICE }}
+        run: |
+          cd tree
+          fail=0
+          # 1. lunch target must exist in AndroidProducts.mk
+          if ! grep -q "${LUNCH_CHOICE}" AndroidProducts.mk; then
+            echo "::error::'${LUNCH_CHOICE}' is not in AndroidProducts.mk"; fail=1
+          fi
+          # 2. kernel prebuilt must exist and not be a git-lfs pointer
+          if [ ! -s prebuilt/kernel ] || head -c 40 prebuilt/kernel | grep -q "git-lfs"; then
+            echo "::error::prebuilt/kernel missing or is an LFS pointer"; fail=1
+          fi
+          # 3. inline comments after := values leave a trailing space in the value
+          if grep -nE ':=[^#]*[[:space:]]#' ./*.mk; then
+            echo "::warning::Inline comments after := values found (trailing space ends up in the value). Apply roadstr-tree-fixes.patch."
+          fi
+          # 4. FOX_ vars are ignored inside .mk files
+          if grep -nE '^\s*FOX_[A-Z_]+\s*:?=' ./*.mk; then
+            echo "::warning::FOX_* variable set in a .mk file. OrangeFox ignores these; pass them via EXTRA_EXPORTS."
+          fi
+          exit $fail
 
-    - name: Check Build Tree
-      uses: haya14busa/action-cond@v1.2.1
-      id: buildtree
-      with:
-        cond: ${{ inputs.MANIFEST_BRANCH == '11' || inputs.MANIFEST_BRANCH == '12.1' }}
-        if_true: aosp
-        if_false: omni
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install \
+            gperf gcc-multilib g++-multilib libc6-dev lib32ncurses5-dev x11proto-core-dev \
+            libx11-dev lib32z-dev libgl1-mesa-dev libxml2-utils xsltproc bc ccache \
+            lib32readline-dev lib32z1-dev liblz4-tool libncurses5-dev libncurses5 libtinfo5 \
+            lzop pngcrush schedtool squashfs-tools imagemagick libbz2-dev lzma ncftp \
+            qemu-user-static zip unzip rsync aria2 python3 curl git
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod a+x ~/bin/repo
+          sudo ln -sf ~/bin/repo /usr/local/bin/repo
+          git config --global user.name "${GITHUB_ACTOR}"
+          git config --global user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
+          git config --global color.ui false
 
-    - name: Install OpenJDK
-      if: steps.buildtree.outputs.value == 'omni'
-      uses: actions/setup-java@v4
-      with:
-        distribution: zulu
-        java-version: 8
+      - name: Sync OrangeFox sources
+        env:
+          FOX_BRANCH: ${{ inputs.FOX_BRANCH }}
+        run: |
+          set -o pipefail
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+          git clone --depth 1 https://gitlab.com/OrangeFox/sync.git "$GITHUB_WORKSPACE/sync"
+          cd "$GITHUB_WORKSPACE/sync"
+          # --path must be ABSOLUTE
+          ./orangefox_sync.sh --branch "$FOX_BRANCH" --path "$GITHUB_WORKSPACE/fox" 2>&1 \
+            | tee "$GITHUB_WORKSPACE/sync.log"
 
-    - name: Install repo
-      run: |
-        mkdir ~/bin
-        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-        chmod a+x ~/bin/repo
-        sudo ln -sf ~/bin/repo /usr/bin/repo
-      
-    - name: Initialize repo
-      run: |
-        mkdir workspace
-        cd workspace
-        git config --global user.name "${GITHUB_ACTOR}"
-        git config --global user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
-        repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_${{ steps.buildtree.outputs.value }}.git -b twrp-${{ inputs.MANIFEST_BRANCH }}
-          
-    - name: Repo Sync
-      run: |
-        repo sync -j$(nproc --all) --force-sync
-      working-directory: workspace
+      - name: Disk usage after sync
+        run: df -h "$GITHUB_WORKSPACE"; free -h; du -sh "$GITHUB_WORKSPACE/fox" || true
 
-    - name: Create roomservice.xml
-      run: |
-        mkdir -p .repo/local_manifests
-        cp -f ${GITHUB_WORKSPACE}/templates/*.xml .repo/local_manifests/
-      working-directory: workspace
+      - name: Place device tree
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/fox/${DEVICE_PATH}"
+          rsync -a --exclude '.git' "$GITHUB_WORKSPACE/tree/" "$GITHUB_WORKSPACE/fox/${DEVICE_PATH}/"
+          ls "$GITHUB_WORKSPACE/fox/${DEVICE_PATH}"
 
-    - name: Clone device tree (TeamWin)
-      if: |
-        contains( inputs.DEVICE_TREE_URL,'/TeamWin/' )
-        && steps.buildtree.outputs.value == 'aosp'
-      run: |
-        sed -i "s%\!--project name=\"{DEVICE_TREE_URL_REPO}%project name=\"$(grep -oP '(?<=TeamWin/).*' <<< ${{ inputs.DEVICE_TREE_URL }})%g" .repo/local_manifests/roomservice.xml
-        sed -i "s%{DEVICE_PATH}%${{ inputs.DEVICE_PATH }}%g" .repo/local_manifests/roomservice.xml
-        sed -i "s%{DEVICE_REMOTE_NAME}%TeamWin%g" .repo/local_manifests/roomservice.xml
-        sed -i "s%{DEVICE_TREE_BRANCH}\"/-->%${{ inputs.DEVICE_TREE_BRANCH }}\"/>%g" .repo/local_manifests/roomservice.xml
-        repo sync -j$(nproc --all)
-      working-directory: workspace
+      - name: Build OrangeFox
+        env:
+          LUNCH_CHOICE: ${{ inputs.LUNCH_CHOICE }}
+          BUILD_TARGET: ${{ inputs.BUILD_TARGET }}
+          EXTRA_EXPORTS: ${{ inputs.EXTRA_EXPORTS }}
+        run: |
+          cd "$GITHUB_WORKSPACE/fox"
+          # envsetup/lunch return non-zero in harmless places, so don't let -e kill us
+          set +e
+          source build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export FOX_BUILD_DEVICE="${DEVICE_NAME}"
+          export LC_ALL=C
+          for kv in $EXTRA_EXPORTS; do export "$kv"; done
+          lunch "$LUNCH_CHOICE" || exit 1
+          mka adbd "$BUILD_TARGET" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          exit "${PIPESTATUS[0]}"
 
-    - name: Clone device tree (Github/Other)
-      if: |
-        !contains( inputs.DEVICE_TREE_URL,'/TeamWin/' )
-        && steps.buildtree.outputs.value == 'aosp'
-      run: |
-        REMOTE_NAME=$(grep -oP '(?<=://).*(?=\.)' <<< ${{ inputs.DEVICE_TREE_URL }})
-        REMOTE_FETCH=$(grep -oP '(?<=://).*?(?=\/)' <<< ${{ inputs.DEVICE_TREE_URL }})
-        if [ "${REMOTE_NAME}" != "github" ]; then
-          sed -i "s%\!--remote name=\"{REMOTE_NAME}%remote name=\"${REMOTE_NAME}%g" .repo/local_manifests/roomservice.xml
-          sed -i "s%{REMOTE_FETCH}\"/-->%${REMOTE_FETCH}\"/>%g" .repo/local_manifests/roomservice.xml
-        fi
-        sed -i "s%\!--project name=\"{DEVICE_TREE_URL_REPO}%project name=\"$(grep -oP "(?<=${REMOTE_FETCH}/).*" <<< ${{ inputs.DEVICE_TREE_URL }})%g" .repo/local_manifests/roomservice.xml
-        sed -i "s%{DEVICE_PATH}%${{ inputs.DEVICE_PATH }}%g" .repo/local_manifests/roomservice.xml
-        sed -i "s%{DEVICE_REMOTE_NAME}%${REMOTE_NAME}%g" .repo/local_manifests/roomservice.xml
-        sed -i "s%{DEVICE_TREE_BRANCH}\"/-->%${{ inputs.DEVICE_TREE_BRANCH }}\"/>%g" .repo/local_manifests/roomservice.xml
-        repo sync -j$(nproc --all)
-      working-directory: workspace
+      - name: Collect outputs
+        if: success()
+        run: |
+          OUT="$GITHUB_WORKSPACE/fox/out/target/product/${DEVICE_NAME}"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp -v "$OUT"/OrangeFox*.img "$OUT"/OrangeFox*.zip "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          ls -la "$GITHUB_WORKSPACE/artifacts"
+          [ -n "$(ls -A "$GITHUB_WORKSPACE/artifacts")" ] || { echo "::error::No OrangeFox output found in $OUT"; ls -la "$OUT"; exit 1; }
 
-    - name: Clone device tree (Omni)
-      if: ${{ steps.buildtree.outputs.value == 'omni' }}
-      run: |
-        git clone ${{ inputs.DEVICE_TREE_URL }} -b ${{ inputs.DEVICE_TREE_BRANCH }} ./${{ inputs.DEVICE_PATH }}
-      working-directory: workspace
+      - name: Upload recovery
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangefox-${{ env.DEVICE_NAME }}
+          path: artifacts/*
+          retention-days: 14
 
-    - name: Sync Device Dependencies (AOSP)
-      if: ${{ steps.buildtree.outputs.value == 'aosp' }}
-      run: |
-        source build/envsetup.sh
-        lunch twrp_${{ inputs.DEVICE_NAME }}-eng
-      working-directory: workspace
-      id: syncdevicedeps
-      continue-on-error: true
+      # Logs are what OrangeFox support will ask for, so always keep them
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}
+          path: |
+            sync.log
+            build.log
+          if-no-files-found: ignore
+          retention-days: 14
 
-    - name: Sync Device Dependencies (Omni/subdevices)
-      if: |
-        steps.buildtree.outputs.value == 'omni'
-        || steps.syncdevicedeps.outcome == 'failure'
-      run: |
-        bash ${GITHUB_WORKSPACE}/scripts/convert.sh ${{ inputs.DEVICE_PATH }}/${{ steps.buildtree.outputs.value }}.dependencies
-        repo sync -j$(nproc --all)
-      working-directory: workspace
-      continue-on-error: true
-
-    - name: Repopick Gerrit patches
-      if: inputs.REPOPICK_PATCHES != null
-      run: |
-        source build/envsetup.sh
-        repopick -g https://gerrit.twrp.me ${{ inputs.REPOPICK_PATCHES }}
-      working-directory: workspace
-      continue-on-error: true
-
-    - name: Include Recovery Installer
-      if: inputs.RECOVERY_INSTALLER == true && inputs.MANIFEST_BRANCH != '6.0' && inputs.BUILD_TARGET != 'vendor_boot'
-      run: |
-        case ${{ inputs.MANIFEST_BRANCH }} in
-          7.1)
-            patchNum=5080
-            ;;
-          8.1)
-            patchNum=5079
-            ;;
-          9.0)
-            patchNum=5037
-            ;;
-          11)
-            patchNum=4964
-            ;;
-          12.1)
-            patchNum=5445
-            ;;
-        esac
-        source build/envsetup.sh
-        repopick -g https://gerrit.twrp.me ${patchNum}
-      working-directory: workspace
-      id: recoveryinstaller
-      continue-on-error: true
-
-    - name: Install Python 2
-      if: ${{ steps.buildtree.outputs.value == 'omni' }}
-      run: |
-        sudo apt -y install python2
-        cd /usr/bin
-        sudo ln -sf python2 python
-
-    - name: Building recovery (AOSP)
-      if: ${{ steps.buildtree.outputs.value == 'aosp' }} 
-      run: |
-        source build/envsetup.sh
-        export ALLOW_MISSING_DEPENDENCIES=true
-        if [ ${{ inputs.RECOVERY_INSTALLER }} = true ] && [ ${{ steps.recoveryinstaller.outcome == 'success' }} ]; then
-          export USE_RECOVERY_INSTALLER=true
-          export RECOVERY_INSTALLER_PATH=bootable/recovery/installer
-        fi
-        lunch twrp_${{ inputs.DEVICE_NAME }}-eng && make $(tr -d _ <<< ${{ inputs.BUILD_TARGET }})image -j$(nproc --all)
-      working-directory: workspace
-
-    - name: Building recovery (Omni)
-      if: ${{ steps.buildtree.outputs.value == 'omni' }} 
-      run: |
-        source build/envsetup.sh
-        export ALLOW_MISSING_DEPENDENCIES=true
-        if [ ${{ inputs.RECOVERY_INSTALLER }} = true ] && [ ${{ steps.recoveryinstaller.outcome == 'success' }} ]; then
-          export USE_RECOVERY_INSTALLER=true
-          export RECOVERY_INSTALLER_PATH=bootable/recovery/installer
-        fi
-        lunch ${{ steps.buildtree.outputs.value }}_${{ inputs.DEVICE_NAME }}-eng && make ${{ inputs.BUILD_TARGET }}image -j$(nproc --all)
-      working-directory: workspace
-
-    - name: Upload to Release
-      uses: softprops/action-gh-release@4634c16e79c963813287e889244c50009e7f0981
-      with:
-        files: |
-          workspace/out/target/product/${{ inputs.DEVICE_NAME }}/${{ inputs.BUILD_TARGET }}.img
-          workspace/out/target/product/${{ inputs.DEVICE_NAME }}/*installer*zip
-          workspace/out/target/product/${{ inputs.DEVICE_NAME }}/obj/PACKAGING/vendor_ramdisk_fragments_intermediates/recovery.*
-          workspace/out/target/product/${{ inputs.DEVICE_NAME }}/ramdisk-recovery.*
-        name: ${{ inputs.DEVICE_NAME }} (TWRP)
-        tag_name: ${{ github.run_id }}
-        body: |
-          Manifest: ${{ inputs.MANIFEST_BRANCH }}
-          Target: ${{ inputs.BUILD_TARGET }}.img
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+# ---------------------------------------------------------------------------
+# NOTES
+#  * Runner size: standard hosted runners are small (as far as I know ~2 vCPU/7 GB
+#    RAM on private repos, ~4 vCPU/16 GB on public ones, and GitHub Pro does not
+#    change that). A public fork is faster, and the OrangeFox wiki says a public
+#    release of patched trees is required by the GPL anyway.
+#  * The wiki's 85 GB / 32 GB RAM figures for 14.1 are for a local full sync. This
+#    workflow merges root + temp disks and adds 16 GB swap, but whether the sync
+#    fits and finishes inside 6 h is UNVERIFIED. Check "Disk usage after sync".
+#  * Actions are pinned to major tags, not commit SHAs. For stricter supply-chain
+#    safety, pin each to a SHA yourself.
+# ---------------------------------------------------------------------------
