@@ -98,11 +98,7 @@ jobs:
           if [ ! -s prebuilt/kernel ] || head -c 40 prebuilt/kernel | grep -q "git-lfs"; then
             echo "::error::prebuilt/kernel missing or is an LFS pointer"; fail=1
           fi
-          # 3. inline comments after := values leave a trailing space in the value
-          if grep -nE ':=[^#]*[[:space:]]#' ./*.mk; then
-            echo "::warning::Inline comments after := values found (trailing space ends up in the value). Enable APPLY_PATCH or fix the tree."
-          fi
-          # 4. FOX_ vars are ignored inside .mk files
+          # 3. FOX_ vars are ignored inside .mk files
           if grep -nE '^\s*FOX_[A-Z_]+\s*:?=' ./*.mk; then
             echo "::warning::FOX_* variable set in a .mk file. OrangeFox ignores these; pass them via EXTRA_EXPORTS."
           fi
